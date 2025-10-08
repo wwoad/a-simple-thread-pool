@@ -1,80 +1,140 @@
-#include"ThreadPool.h"
-#include"Thread.h"
-#include<iostream>
-#include<mutex>
-#include<string>
-#include<functional>
 
-const int TASK_MAX_SIZE  = 20;
+#include "threadpool.h"
 
-ThreadPool::ThreadPool()
-	:tasks_max_size(TASK_MAX_SIZE)
-	,queue_task_size(0)
-	,thread_size(4)
-{ }
+ThreadPool::ThreadPool(int minThread, int maxThread)
+    : m_minThread(minThread), m_maxThread(maxThread), m_stop(false), m_idleThread(minThread), m_curThread(minThread), m_exitThread(0)
+{
+    // create manager thread
+    m_manager = std::make_unique<std::thread>(&ThreadPool::manager, this);
+    // craete work thread
+    for (int i = 0; i < minThread; i++)
+    {
+        std::thread t(&ThreadPool::worker, this);
+        m_worker.insert(std::make_pair(t.get_id(), std::move(t))); // add work thread input work map
+    }
+}
 
-//Îö¹¹
 ThreadPool::~ThreadPool()
 {
+    m_stop = true;
+    m_condition.notify_all();
+
+    for (auto &it : m_worker)
+    {
+        if (it.second.joinable())
+        {
+            it.second.join();
+            std::cout << " -------çº¿ç¨‹: " << it.first << "å·²é€€å‡º--------" << endl;
+        }
+    }
+
+    if (m_manager->joinable())
+    {
+        std::cout << " -------ç®¡ç†çº¿ç¨‹: " << m_manager->get_id() << "å·²é€€å‡º--------" << endl;
+        m_manager->join();
+    }
+    std::this_thread::sleep_for(std::chrono::seconds(1));
 }
 
-//¹¦ÄÜº¯Êý
-void ThreadPool::runThreadPool(int ThreadSize)//ÔËÐÐÏß³Ì³Ø
+void ThreadPool::addTask(std::shared_ptr<Task> sp)
 {
-	this->thread_size = ThreadSize;
+    std::function<void()> task = [sp]()
+    { sp->run(); };
 
-	for (int i = 0; i < ThreadSize; i++)
-	{
-		//´´½¨Ïß³Ì¶ÔÏó£¬½«Ö´ÐÐÈÎÎñº¯Êý°ó¶¨¸øÏß³Ì¶ÔÏó
-		auto ptr = std::make_unique<Thread>(std::bind(&ThreadPool::doTask, this));
-		//½«ÐÂ½¨µÄÏß³Ì¶ÔÏó²åÈëÏß³ÌÈÝÆ÷
-		this->vector_thread.emplace_back(std::move(ptr));
-	}
-
-	for (int i = 0; i < ThreadSize; i++)
-	{
-		//Ïß³ÌÖ´ÐÐÈÎÎñ
-		this->vector_thread[i]->doTask();
-	}
+    {
+        std::lock_guard<std::mutex> locker(m_queMutex);
+        m_taskQue.emplace(task);
+    }
+    m_condition.notify_one();
 }
 
-void ThreadPool::doTask()//Ö´ÐÐÈÎÎñ
+void ThreadPool::addTask(std::function<void(void)> func)
 {
-	for (;;)
-	{
-		std::shared_ptr<Task> task_ptr;
-		
-		{
-			std::unique_lock<std::mutex> lock(this->mtx);
-			this->que_not_empty.wait(lock,[&]()->bool {return queue_task.size() > 0; });
-			task_ptr = std::move(queue_task.front());
-			this->queue_task.pop();
-			this->queue_task_size--;
-			this->que_not_empty.notify_all();
-		}
-		if (task_ptr != nullptr)
-		{
-			//Ö´ÐÐÈÎÎñ
-			task_ptr->runTask();
-		}
-	}
+    {
+        std::lock_guard<std::mutex> locker(m_queMutex);
+        m_taskQue.emplace(func);
+    }
+    m_condition.notify_one();
 }
 
-//Ìá½»ÈÎÎñ
-void ThreadPool::commitTask(std::shared_ptr<Task> Ptask)
+void ThreadPool::stop()
 {
-	
-	std::unique_lock<std::mutex> lock(this->mtx);
+    m_stop.store(true);
+}
 
-	if (!this->que_not_full.wait_for(lock, std::chrono::seconds(1),
-		[this]() ->bool{return queue_task.size() <  tasks_max_size; }))
-	{
-		std::cout <<"the task commit fail" << std::endl;
-		return;
-	}
+void ThreadPool::manager(void)
+{
+    while (!m_stop.load())
+    {
+        std::this_thread::sleep_for(std::chrono::seconds(1));
 
-	queue_task.emplace(Ptask);
-	this->queue_task_size++;
-	std::cout << " task conmmit successful " << std::endl;
-	this->que_not_empty.notify_all();
+        int idle = m_idleThread;
+        int cur = m_curThread;
+
+        if (idle > (cur / 2) && cur > m_minThread)
+        {
+            m_exitThread.store(2);
+            m_condition.notify_all();
+            std::this_thread::sleep_for(std::chrono::seconds(2));
+            {
+                std::lock_guard<std::mutex> locker(m_tidMutex);
+                for (auto id : m_tid)
+                {
+                    auto it = m_worker.find(id);
+                    if (it != m_worker.end())
+                    {
+                        std::cout << "------çº¿ç¨‹" << (*it).first << "è¢«é”€æ¯" << endl;
+                        (*it).second.join();
+                        m_worker.erase(it);
+                    }
+                }
+                m_tid.clear();
+            }
+        }
+        else if (idle == 0 && cur < m_maxThread)
+        {
+            std::thread t(&ThreadPool::worker, this);
+            m_worker.insert(std::make_pair(t.get_id(), std::move(t))); // add work thread input work map
+            std::cout << "-------åˆ›å»ºä¸€ä¸ªçº¿ç¨‹--------" << endl;
+            m_curThread++;
+            m_idleThread++;
+        }
+    }
+}
+
+void ThreadPool::worker(void)
+{
+    while (!m_stop.load())
+    {
+        std::function<void()> task;
+        {
+            std::unique_lock<std::mutex> locker(m_queMutex);
+
+            while (m_taskQue.empty() && !m_stop.load())
+            {
+                m_condition.wait(locker);
+                if (m_exitThread.load() > 0)
+                {
+                    m_curThread--;
+                    m_idleThread--;
+                    m_exitThread--;
+                    std::cout << "-------çº¿ç¨‹é€€å‡º,ID:" << std::this_thread::get_id() << endl;
+                    std::lock_guard<std::mutex> lck(m_tidMutex);
+                    m_tid.emplace_back(std::this_thread::get_id());
+                    return;
+                }
+            }
+            if (!m_taskQue.empty())
+            {
+                task = std::move(m_taskQue.front());
+                m_taskQue.pop();
+            }
+        }
+        if (task)
+        {
+            m_idleThread--;
+            task();
+            m_idleThread++;
+        }
+    }
 }
